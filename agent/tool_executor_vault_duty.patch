@@ -1,0 +1,56 @@
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index 438a63370..3ce1a5323 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -62,6 +62,31 @@ def _ra():
+     return run_agent
+ 
+ 
++# ── DIKW vault-write duty injection ────────────────────────────────────
++# Source-level enforcement: after every write_file to a vault path, inject
++# an extraction reminder into the tool result so the LLM sees the duty on
++# its next turn. This is a hard-coded rule, not a SOUL.md reminder.
++_VAULT_DUTY_NOTE = (
++    "\n\n[DUTY: 你刚刚将完整文档写入 vault。根据 DIKW 模型，你必须在此后自动提炼 1-3 条核心方法论，"
++    "用事实库（fact_store）存入大脑。这是源码级强制规则，不依赖用户提醒。]"
++)
++
++
++def _inject_vault_duty(function_name: str, function_args: dict, messages: list) -> None:
++    """If the tool just wrote to a vault path, inject the extraction duty."""
++    if function_name != "write_file":
++        return
++    _path = function_args.get("path", "") or ""
++    if not _path:
++        return
++    _normalized = _path.replace(os.sep, "/")
++    if "vault" not in _normalized.split("/"):
++        return
++    current = messages[-1].get("content", "")
++    if isinstance(current, str):
++        messages[-1]["content"] = current + _VAULT_DUTY_NOTE
++
++
+ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+     """Execute multiple tool calls concurrently using a thread pool.
+ 
+@@ -446,6 +471,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
+         _tool_content = agent._tool_result_content_for_active_model(name, function_result)
+         messages.append(make_tool_result_message(name, _tool_content, tc.id))
+ 
++        # ── DIKW vault-write duty injection ─────────────────────────
++        _inject_vault_duty(name, args, messages)
++
+         # ── Per-tool /steer drain ───────────────────────────────────
+         # Same as the sequential path: drain between each collected
+         # result so the steer lands as early as possible.
+@@ -862,6 +890,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
+         messages.append(make_tool_result_message(function_name, _tool_content, tool_call.id))
+ 
++        # ── DIKW vault-write duty injection ─────────────────────────
++        _inject_vault_duty(function_name, function_args, messages)
++
+         # ── Per-tool /steer drain ───────────────────────────────────
+         # Drain pending steer BETWEEN individual tool calls so the
+         # injection lands as soon as a tool finishes — not after the
