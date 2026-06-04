@@ -1,0 +1,88 @@
+# CHANGELOG — DIKW 记忆系统跨版本演进
+
+> **项目**：DIKW-Memory-System
+> **仓库**：https://github.com/Zhao961215/DIKW-Memory-System
+> **当前推荐版本**：**v2.1**（含 5-layer 自愈 + CIRAAF）
+
+---
+
+## 版本对比总览
+
+| 维度 | v1.0 | v2.0 | **v2.1（最新）** |
+|------|------|------|------------------|
+| **发布时间** | 2026-06-01 | 2026-06-03 | 2026-06-03 |
+| **状态** | 📦 历史版本 | 📦 历史版本 | ✅ **推荐** |
+| **自愈层数** | 4-layer | 4-layer | **5-layer** |
+| **信息流版本** | v1 | v2（HRR+CJK 2-gram+retrieval_count修复+Tavily）| v2 |
+| **CIRAAF 5-layer** | ❌ | ❌ | ✅ |
+| **仓库 description** | 4-layer | 4-layer | **5-layer + CIRAAF** |
+| **README 文档** | 20K | — | 20K（描述已更新）|
+| **完整指南** | 25K | 49K | 49K + 30K CIRAAF |
+
+---
+
+## v2.1 (2026-06-03) — 5-layer + CIRAAF ⭐ 当前
+
+**核心升级**：
+- 新增第⑤层 CIRAAF 宏观重构（领域级结构一致性）
+- 仓库 description 更新为 5-layer + CIRAAF
+- 三齿轮架构：Gear 1（源码机械引擎）+ Gear 2（cron skill 反射）+ Gear 3（源码应用修复）
+- 5 大领域健康监控：投资 63 / 系统 62 / 用户 64 / 开发 60 / 方法 57
+- 零 LLM 比例：66%（4/6 cron no_agent）
+
+**部署**：
+```bash
+# 完整 v2.1 部署
+cp -r v2.1/* ~/.hermes/
+cp agent/cirAAF_mechanic.py ~/.hermes/hermes-agent/agent/
+hermes restart
+```
+
+详见：[v2.1/CHANGELOG-from-v2.0.md](v2.1/CHANGELOG-from-v2.0.md)
+
+---
+
+## v2.0 (2026-06-03) — 信息流 v2 升级
+
+**核心升级**：
+- 信息流 v2 升级：`agent/information_flow/impl_v2.py` 成为默认
+  - L1 FTS5 + Jaccard + HRR 三重混合评分
+  - CJK 2-gram 滑窗分词（修复 unicode61 不分割 CJK）
+  - retrieval_count 字段递增（修复 99.8% 冷数据假象）
+  - L2-L4 ThreadPoolExecutor 并行
+  - L6 Tavily HTTP 直连
+- 49K 完善版指南替换 25K 早期版
+
+**数据**：
+- 中文长句检索：0% 命中 → 100% 命中（6/6 测试）
+- 冷数据比：99.8% 假象 → 真实统计
+- L2-L4 串行耗时：7T → T（并行）
+
+详见：[v2.0/CHANGELOG-from-v1.0.md](v2.0/CHANGELOG-from-v1.0.md)
+
+---
+
+## v1.0 (2026-06-01) — 4-layer 基础版
+
+**核心特性**：
+- Holographic 记忆引擎（SQLite + FTS5 + HRR 双引擎）
+- 4-layer 自愈闭环：
+  - ① 技能自动触发（`agent/skill_auto_trigger.py`）
+  - ② 容量管理（`memory-capacity-management` skill + cron 每日 9:00）
+  - ③ 信任校准（`agent/fact_feedback_loop.py` + cron 每周六 11:00）
+  - ④ vault-write 强制提炼（`agent/tool_executor.py` 源码钩子）
+- DIKW 三层分流（D / I / K / W）
+- 6 层递进检索流水线
+
+详见：[v1.0/README.md](v1.0/README.md)
+
+---
+
+## 选择建议
+
+| 你的情况 | 推荐版本 |
+|---------|---------|
+| 全新部署 / 想用最新功能 | **v2.1** |
+| 已有 v1.0 部署，想升级 | 直接升级到 **v2.1**（增量包含 v2.0）|
+| 已有 v2.0 部署，想升级到 v2.1 | [v2.1/CHANGELOG-from-v2.0.md](v2.1/CHANGELOG-from-v2.0.md) |
+| 维护中，不想升级 | 保留当前版本，但关注 [Releases](https://github.com/Zhao961215/DIKW-Memory-System/releases) |
