@@ -76,6 +76,23 @@ python3 -m agent.cirAAF_mechanic
 
 ---
 
+
+### v2.2.1 (2026-06-04) — 零配置算法修复（v2.2 必备补丁）
+
+发布后实测发现 3 个算法 bug + 1 个数据丢失 bug，全部修复：
+
+- **STOP_TAGS 黑名单**：Hindsight 时代残留元数据 tag（`auto-retain`/`observation`/`discovery` 等 12 个）污染聚类结果 → 过滤
+- **IDF 过滤**：通用 2-gram（"使用"/"一个"等）成 hub 节点拉了 22% fact 成一类 → IDF_THRESHOLD=0.30
+- **健康分公式**：v2.2 公式 `int(avg × (1-zero_ret) × 100)` 在 zero_ret=100% 时直接归零 → 改回 v2.1 风格 + 软惩罚
+- **单点 fact 丢失 bug**（**严重**）：贪心聚类的 `else: visited.add(fid)` 让单点也 visited，misc 收容逻辑收不到 → 7254 条 fact 丢失，删 else 分支修复
+- **MIN_CLUSTER_SIZE=25**：v2.2 默认 5，22% 巨聚类 + 13 个 <30 条小聚类，v2.1 5 大领域感更友好
+
+**v2.2 升 v2.2.1 步骤**：
+```bash
+git pull origin main
+python3 -m agent.cirAAF_mechanic --rediscover
+```
+
 ## v2.1 (2026-06-03) — 5-layer + CIRAAF ⭐ 当前
 
 **核心升级**：

@@ -35,7 +35,7 @@ REPORT_DIR = Path(os.environ.get("HOLOGRAPHIC_REPORT_DIR", str(Path.home() / ".h
 
 # ── 自动领域发现配置（v2.2 改造：零配置，按 Holographic 实际数据聚类）─────────
 DOMAIN_CACHE_PATH = Path(os.environ.get("HOLOGRAPHIC_REPORT_DIR", str(Path.home() / ".hermes" / "data" / "cirAAF"))) / "domain_cache.json"
-MIN_CLUSTER_SIZE = 5            # 聚类最小 fact 数（小于此数的散点合并到 misc）
+MIN_CLUSTER_SIZE = 25           # v2.2.1 调整：聚类最小 fact 数 5→25（主上系统有 22% 巨聚类 + 13 个 <30 条小聚类，v2.1 硬编码 5 大领域感更友好；v2.2.1 默认 25 可调，0 表示不限制）
 MAX_CLUSTERS = 15               # 最多聚类数（超过按 fact 数取 top N + 溢出合并 misc）
 SIMILARITY_THRESHOLD = 0.18     # Jaccard 相似度阈值（经验值，0.15-0.25 平衡点）
 TOP_CANDIDATES = 200            # 倒排索引候选 top N（控制 O(n×N) 计算量）
@@ -44,6 +44,21 @@ STOP_KEYWORDS = {                # 聚类命名停用词
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "this", "that",
     "these", "those", "it", "its", "和", "的", "是", "在", "了", "与", "或", "也", "但", "就", "都",
 }
+STOP_TAGS = frozenset({           # 聚类特征停用 tag（v2.2.1 修复：Hindsight 元数据噪音）
+    "auto-retain",                # Hindsight 时代自动打标残留
+    "observation",                # 同上
+    "discovery",                  # 同上
+    "category",                   # fact_store 错用残留
+    "content",                    # 同上
+    "fact",                       # 同上
+    "reflect",                    # Hindsight 时代分类
+    "skill_update",               # skill auto-retain
+    "memory",                     # 通用元数据
+    "skill",                      # Hindsight 时代残留
+    "auxiliary.compression",      # 错用 fact_store 留下
+    "顶层compression",            # 同上
+})
+IDF_THRESHOLD = 0.30              # v2.2.1 修复：出现率 >30% 的特征视为通用（hub 节点元凶），过滤掉
 
 
 def extract_features(fact: dict) -> set:
@@ -68,8 +83,8 @@ def extract_features(fact: dict) -> set:
     # 英文/数字单词（≥2 字符）
     words = set(re.findall(r"[a-zA-Z_][a-zA-Z_0-9]+", content))
 
-    # tags
-    tag_set = {t.strip() for t in tags_str.split(",") if t.strip()}
+    # tags (v2.2.1 修复：过滤 Hindsight 元数据噪音)
+    tag_set = {t.strip() for t in tags_str.split(",") if t.strip() and t.strip() not in STOP_TAGS}
 
     feats = bigrams | words | tag_set
     if category:
@@ -132,6 +147,18 @@ def auto_discover_domains(conn: sqlite3.Connection) -> dict[str, dict]:
     if not features:
         return {"misc": {"members": [], "fact_count": 0, "top_keywords": [], "health": 0}}
 
+    # ②.b v2.2.1 IDF 过滤：去除通用特征（出现率 > IDF_THRESHOLD 的视为通用，过滤掉）
+    feature_doc_count: Counter = Counter()
+    for fid, feats in features.items():
+        for feat in feats:
+            feature_doc_count[feat] += 1
+    n_docs = len(features)
+    common_features = {feat for feat, count in feature_doc_count.items() if count / n_docs > IDF_THRESHOLD}
+    features = {fid: feats - common_features for fid, feats in features.items()}
+    features = {fid: feats for fid, feats in features.items() if feats}  # 删空 fact
+    if not features:
+        return {"misc": {"members": [], "fact_count": 0, "top_keywords": [], "health": 0}}
+
     # ③ 倒排索引
     inverted: dict[str, set] = {}
     for fid, feats in features.items():
@@ -171,8 +198,8 @@ def auto_discover_domains(conn: sqlite3.Connection) -> dict[str, dict]:
         if len(cluster) >= MIN_CLUSTER_SIZE:
             clusters.append(cluster)
             visited |= cluster
-        else:
-            visited.add(fid)  # 散点不开新聚类，留给 misc 收容
+        # v2.2.1 修复：单点 fact 不加 visited（留给 L212 misc 收容）
+        # 旧 bug：else: visited.add(fid) → 单点也 visited → misc 收不到 → fact 丢失
 
     # ⑤ 散点合并到 misc
     big_clusters = [c for c in clusters if len(c) >= MIN_CLUSTER_SIZE]
@@ -227,7 +254,11 @@ def auto_discover_domains(conn: sqlite3.Connection) -> dict[str, dict]:
         avg_trust = sum(m["trust_score"] for m in members_data) / len(members_data)
         zero_ret = sum(1 for m in members_data if (m.get("retrieval_count") or 0) == 0)
         zero_ret_rate = zero_ret / len(members_data)
-        health = int(avg_trust * (1 - zero_ret_rate) * 100)
+        # v2.2.1 修复：综合评估（信任分 + fact 数 + 软惩罚 zero_ret）
+        # 公式：base = min(avg/0.8*40, 40) + min(fact_count/200*30, 30) + 30
+        # 软惩罚：× (1 - zero_ret_rate * 0.3)（最多扣 30%）
+        base = min(avg_trust / 0.8 * 40, 40) + min(len(members_data) / 200 * 30, 30) + 30
+        health = int(min(100, base * (1 - zero_ret_rate * 0.3)))
 
         domains[name] = {
             "members": [m["fact_id"] for m in members_data],
