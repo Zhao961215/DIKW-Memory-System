@@ -86,10 +86,25 @@ cd DIKW-Memory-System-2.1/v2.1/
 
 # 3. 部署 CIRAAF（v2.1 增量）
 cp agent/cirAAF_mechanic.py ~/.hermes/hermes-agent/agent/
+cp scripts/cirAAF_mechanic.sh ~/.hermes/scripts/cirAAF_mechanic.sh
+chmod +x ~/.hermes/scripts/cirAAF_mechanic.sh
+cp scripts/information_flow_health.py ~/.hermes/scripts/
+mkdir -p ~/.hermes/skills/system
+cp -r skills/system/brain-periodic-refactor ~/.hermes/skills/system/
 hermes restart
 
-# 4. 健康检查
-python3 -m agent.cirAAF_mechanic --report
+# 4. 注册 CIRAAF 周健康报告 cron（每周日 10:00，no_agent 模式）
+# ⚠️ 必须设 workdir + script 绝对路径，否则裸名解析失败（CIRAAF 周报从未跑过的根因）
+hermes cron add --name "CIRAAF 周健康报告" \
+    --schedule "0 10 * * 0" \
+    --no-agent \
+    --workdir "/home/$USER/.hermes/hermes-agent" \
+    --script "/home/$USER/.hermes/scripts/cirAAF_mechanic.sh" \
+    --deliver origin
+
+# 5. 健康检查（默认输出健康报告；--decay 三条件检查）
+python3 -m agent.cirAAF_mechanic
+python3 ~/.hermes/scripts/information_flow_health.py
 ```
 
 ---

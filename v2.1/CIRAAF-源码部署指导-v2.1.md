@@ -527,24 +527,43 @@ python3 -m agent.cirAAF_mechanic --decay
 
 ### 4.1 首次部署
 
-```bash
-# 1. 将 cirAAF_mechanic.py 放到 agent/ 目录
-cp cirAAF_mechanic.py ~/.hermes/hermes-agent/agent/
+> ⚠️ **关键修复（2026-06-04）**：旧版部署命令有几处会让 cron 任务**静默失败**——
+> 1. `cp cirAAF_mechanic.py` 用裸名（仓库根没这个文件，正确路径是 `agent/cirAAF_mechanic.py`）
+> 2. `cp cirAAF_mechanic.sh` 同样问题（应在 `scripts/` 子目录）
+> 3. cron 任务 `script="cirAAF_mechanic.sh"` 是裸名 + 没设 `workdir` → 调度时找不到脚本（jobs.py 源码注释明示"cron jobs run detached from any shell cwd, so relative paths have no stable meaning"）
+>
+> **修复后命令**（下面所有 `cp` 都从仓库根目录执行，确保源路径是仓库相对路径）：
 
-# 2. 创建 cron 包装脚本
-cp cirAAF_mechanic.sh ~/.hermes/scripts/
+```bash
+# 1. CIRAAF 机械引擎（Gear 1 零 LLM）
+cp agent/cirAAF_mechanic.py ~/.hermes/hermes-agent/agent/
+
+# 2. Cron 包装脚本（72 行新版，含 --decay 段）
+cp scripts/cirAAF_mechanic.sh ~/.hermes/scripts/cirAAF_mechanic.sh
 chmod +x ~/.hermes/scripts/cirAAF_mechanic.sh
 
-# 3. 更新 brain-periodic-refactor skill
-#    （如果 skill 已存在，手动合并自动化架构章节）
+# 3. Gear 2 LLM 反射 skill（brain-periodic-refactor）
+mkdir -p ~/.hermes/skills/system
+cp -r skills/system/brain-periodic-refactor ~/.hermes/skills/system/
+```
 
-# 4. 创建 cron 任务（使用 Hermes CLI 或 tools）
-cronjob action=create \
-  name="CIRAAF 周健康报告" \
-  schedule="0 10 * * 0" \
-  no_agent=true \
-  script="cirAAF_mechanic.sh" \
-  deliver="origin"
+```bash
+# 4. 创建 cron 任务（必须 workdir + script 绝对路径）
+hermes cron add --name "CIRAAF 周健康报告" \
+    --schedule "0 10 * * 0" \
+    --no-agent \
+    --workdir "/home/$USER/.hermes/hermes-agent" \
+    --script "/home/$USER/.hermes/scripts/cirAAF_mechanic.sh" \
+    --deliver origin
+
+# 5. 部署 information_flow_health.py（信息流 v2 健康检查）
+cp scripts/information_flow_health.py ~/.hermes/scripts/
+
+# 6. 健康验证（默认输出健康报告；--decay 三条件检查；--domain 详细扫描）
+python3 -m agent.cirAAF_mechanic
+python3 -m agent.cirAAF_mechanic --decay
+python3 -m agent.cirAAF_mechanic --domain 投资
+python3 ~/.hermes/scripts/information_flow_health.py
 ```
 
 ### 4.2 验证部署

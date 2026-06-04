@@ -41,7 +41,7 @@
 | 定位 | 领域级结构一致性 |
 | 实现 | `agent/cirAAF_mechanic.py` + `brain-periodic-refactor` skill + cron 每周日 10:00 |
 | 三齿轮 | Gear 1（源码机械引擎）+ Gear 2（cron skill 反射）+ Gear 3（源码应用修复） |
-| 5 大领域 | 投资 63 / 系统 62 / 用户 64 / 开发 60 / 方法 57（健康分） |
+| 5 大领域 | **实时数据**（运行 `python3 -m agent.cirAAF_mechanic --report` 获取；数值依事实库而异） |
 | 机械衰减 | DB >60 天激活；年龄守卫保护幼年数据 |
 | 零 LLM 比例 | 3 个 cron 中 2 个是 no_agent（~66% 零 LLM） |
 
@@ -73,17 +73,29 @@
 cp agent/cirAAF_mechanic.py ~/.hermes/hermes-agent/agent/
 
 # 2. 创建 cron 包装脚本
-cp scripts/cirAAF_mechanic.sh ~/.hermes/scripts/
+cp scripts/cirAAF_mechanic.sh ~/.hermes/scripts/cirAAF_mechanic.sh
+chmod +x ~/.hermes/scripts/cirAAF_mechanic.sh
 
-# 3. 注册 cron（每周日 10:00，no_agent 模式）
-cronjob(action='create', name='cirAAF-mechanic',
-        script='cirAAF_mechanic.sh',
-        schedule='0 10 * * 0',
-        no_agent=True)
+# 3. 注册 brain-periodic-refactor skill（Gear 2 LLM 反射层）
+mkdir -p ~/.hermes/skills/system
+cp -r skills/system/brain-periodic-refactor ~/.hermes/skills/system/
 
-# 4. 健康验证
-python3 -m agent.cirAAF_mechanic --report
+# 4. 注册 cron（每周日 10:00，no_agent 模式）
+# ⚠️ 必须设 workdir + script 绝对路径，否则裸名解析失败（CIRAAF 周报从未跑过的根因）
+hermes cron add --name "CIRAAF 周健康报告" \
+    --schedule "0 10 * * 0" \
+    --no-agent \
+    --workdir "/home/$USER/.hermes/hermes-agent" \
+    --script "/home/$USER/.hermes/scripts/cirAAF_mechanic.sh" \
+    --deliver origin
+
+# 5. 健康验证（默认输出健康报告；--decay 三条件检查；--domain 详细扫描）
+python3 -m agent.cirAAF_mechanic
+python3 -m agent.cirAAF_mechanic --decay
+python3 -m agent.cirAAF_mechanic --domain 投资
 ```
+
+> **注意**：v2.1 的 `cirAAF_mechanic.py` 不支持 `--report` 参数（早期版本有过，已移除）。默认行为就是输出健康报告。完整参数见 `python3 -m agent.cirAAF_mechanic --help`。
 
 ---
 
