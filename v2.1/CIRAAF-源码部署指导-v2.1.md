@@ -75,7 +75,7 @@ from typing import Any
 DB_PATH = Path.home() / ".hermes" / "memory_store.db"
 REPORT_DIR = Path.home() / ".hermes" / "data" / "cirAAF"
 
-# 五大领域定义（category 匹配 + 关键词 + 标记 + 优先级）
+# 五大领域定义（v2.1）—— v2.2 已改为自动聚类，参考下方
 DOMAINS: dict[str, dict[str, Any]] = {
     "投资": {
         "categories": ["investment", "project"],
@@ -84,35 +84,24 @@ DOMAINS: dict[str, dict[str, Any]] = {
         "max_age_days": 30,
         "priority": "high",
     },
-    "系统": {
-        "categories": ["system", "tool"],
-        "keywords": "hermes memory holographic skill cron config tool toolset gateway",
-        "refactored_tag": "refactored:系统",
-        "max_age_days": 45,
-        "priority": "medium",
-    },
-    "用户": {
-        "categories": ["user_pref"],
-        "keywords": "用户 偏好 风格 沟通 决策",
-        "refactored_tag": "refactored:用户",
-        "max_age_days": 60,
-        "priority": "low",
-    },
-    "开发": {
-        "categories": ["project", "decision", "discovery"],
-        "keywords": "项目 github 设计 插件 dikw github gitea",
-        "refactored_tag": "refactored:开发",
-        "max_age_days": 45,
-        "priority": "medium",
-    },
-    "方法": {
-        "categories": ["general", "reflect"],
-        "keywords": "框架 方法论 原则 过程 元认知 思维 模型",
-        "refactored_tag": "refactored:方法",
-        "max_age_days": 60,
-        "priority": "low",
-    },
+    ...（其余 4 个领域略，详见 v2.1 git tag）
 }
+
+# ── v2.2 改造：自动领域发现（替代硬编码 DOMAINS）────────────────────
+# 算法：fact content 2-gram + tag + category 特征 → 倒排索引 → Jaccard 贪心聚类
+# 输出：N 个"自然领域"（Top 3 关键词命名，如"投资-PE+动量+止盈"）
+def auto_discover_domains(conn):
+    cur = conn.execute(
+        "SELECT fact_id, content, category, tags, trust_score "
+        "FROM facts WHERE trust_score > 0.3"
+    )
+    facts = [dict(r) for r in cur]
+    # ...（特征提取 + 倒排索引 + 贪心聚类 + 命名，~150 行核心代码）
+    # 完整源码：见 agent/cirAAF_mechanic.py L66-218
+    return domains  # {"投资-PE+动量+止盈": {"members": [...], "health": 56, ...}}
+
+# 调用：load_or_discover_domains(conn)  ← 带缓存，缓存位置 ~/.hermes/data/cirAAF/domain_cache.json
+# 强制重发现：load_or_discover_domains(conn, force_rediscover=True)  或命令行 --rediscover
 
 # 衰减规则（三条件判断通过后才执行）
 DECAY_RULES = {

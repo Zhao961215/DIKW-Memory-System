@@ -18,6 +18,61 @@
 | **仓库 description** | 4-layer | 4-layer | **5-layer + CIRAAF** |
 | **README 文档** | 20K | — | 20K（描述已更新）|
 | **完整指南** | 25K | 49K | 49K + 30K CIRAAF |
+| **领域划分** | 4-layer 硬编码 | 4-layer 硬编码 | 5 大领域硬编码（投资/系统/用户/开发/方法） |
+
+---
+
+## v2.2 (2026-06-04) — 零配置自动聚类 ⚠️ 破坏性升级
+
+**核心升级**：把硬编码 5 大领域改为**自动聚类**——按 Holographic 实际 fact 数据自动发现 N 个"自然领域"。
+
+**为什么**：v2.1 硬编码 5 大领域是**主上本地专用**（投资/系统/用户/开发/方法），别人下载后领域是空的（或数字是错的）。v2.2 改成"按 Holographic 实际数据自动聚类"——**别人下载立即贴合自己**，零配置。
+
+**改动清单**：
+| 类别 | 改动 |
+|---|---|
+| 新增 | `auto_discover_domains()` 函数（~150 行）—— Jaccard 贪心连通子图聚类 + Top 3 关键词命名 |
+| 新增 | `load_or_discover_domains()` 函数——带缓存（`~/.hermes/data/cirAAF/domain_cache.json`） |
+| 新增 | `--rediscover` 命令行参数——强制重发现，忽略缓存 |
+| 删除 | 硬编码 `DOMAINS` 字典（37 行）|
+| 改造 | `scan_domain()` / `_check_domain_decay_readiness()` / `apply_decay()` / `build_refactor_package()` —— 从 `category IN (cats)` 改为 `fact_id IN (members)` |
+| 改造 | `main()` —— 先 `load_or_discover_domains()` 再扫描所有领域 |
+| 新增 | `HOLOGRAPHIC_DB_PATH` / `HOLOGRAPHIC_REPORT_DIR` 环境变量——支持隔离部署 + mock 测试 |
+
+**算法**（4 步）：
+1. 拉所有 `trust > 0.3` 的 fact（排除已降权垃圾）
+2. 提取特征（中文 2-gram + 英文单词 + tags + category）
+3. 倒排索引 + Jaccard 贪心聚类（O(n × 200) ≈ 1.5M 次/7774 facts）
+4. Top 3 关键词命名（如"投资-PE+动量+止盈"）
+
+**零 LLM 比例**：从 ~66% 升到 **~95%**（聚类 + 健康分全零 LLM，只有 v2.3+ 的 LLM 命名才需要 LLM）。
+
+**⚠️ 破坏性变更**：
+- 旧 `python3 -m agent.cirAAF_mechanic --domain 投资` 命令**失效**（领域名变了）
+- 解决：先用默认报告看真实领域名（聚类关键词拼接）
+- 旧 `~/.hermes/data/cirAAF/health_history.json` 兼容（领域键变 → 历史记录从 0 开始）
+
+**升级方法**：标准 3 步（拉新版 + 跑一次 + 看输出）
+
+```bash
+# 1. 拉新版（标准升级流程）
+git pull origin main
+
+# 2. 跑一次（自动聚类，结果写缓存）
+python3 -m agent.cirAAF_mechanic
+
+# 3. 看输出（领域名是动态生成的"关键词+关键词+关键词"格式）
+# 如：投资-PE+动量+止盈  (健康分: 56/100)
+```
+
+**缓存机制**：
+- 首次跑：自动聚类（~30 秒/7774 facts）+ 写缓存
+- 后续跑：读缓存（瞬时）—— 除非 fact 总数增长 20% 才重发现
+- 强制重发现：`--rediscover` 或 `load_or_discover_domains(force_rediscover=True)`
+
+**已知限制**：
+- 聚类名每次可能微变（top 关键词变化）—— 旧 --domain 命令可能失效 → 解决：定期用默认报告看新聚类名
+- 中文 stop word 词典 27 个——可能漏掉一些（比如"也"在"也是"是 stop 但在"也买"是关键词）—— v2.3+ 优化
 
 ---
 

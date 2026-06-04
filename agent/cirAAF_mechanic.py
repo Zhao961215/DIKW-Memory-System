@@ -19,55 +19,269 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
-DB_PATH = Path.home() / ".hermes" / "memory_store.db"
-REPORT_DIR = Path.home() / ".hermes" / "data" / "cirAAF"
+import os
+DB_PATH = Path(os.environ.get("HOLOGRAPHIC_DB_PATH", str(Path.home() / ".hermes" / "memory_store.db")))
+REPORT_DIR = Path(os.environ.get("HOLOGRAPHIC_REPORT_DIR", str(Path.home() / ".hermes" / "data" / "cirAAF")))
 
-# 五大领域定义（关键词用于 category 模糊匹配 + 内容关键词检索）
-DOMAINS: dict[str, dict[str, Any]] = {
-    "投资": {
-        "categories": ["investment", "project"],
-        "keywords": "PE 仓位 动量 止盈 探风 挖呗 潜风 乘风 换风 六风 基金 持仓 估值 数据源",
-        "refactored_tag": "refactored:投资",
-        "max_age_days": 30,
-        "priority": "high",
-    },
-    "系统": {
-        "categories": ["system", "tool"],
-        "keywords": "hermes memory holographic skill cron config tool toolset gateway",
-        "refactored_tag": "refactored:系统",
-        "max_age_days": 45,
-        "priority": "medium",
-    },
-    "用户": {
-        "categories": ["user_pref"],
-        "keywords": "用户 偏好 风格 主上 沟通 决策",
-        "refactored_tag": "refactored:用户",
-        "max_age_days": 60,
-        "priority": "low",
-    },
-    "开发": {
-        "categories": ["project", "decision", "discovery"],
-        "keywords": "项目 github 设计 插件 dikw github gitea",
-        "refactored_tag": "refactored:开发",
-        "max_age_days": 45,
-        "priority": "medium",
-    },
-    "方法": {
-        "categories": ["general", "reflect"],
-        "keywords": "框架 方法论 原则 过程 元认知 思维 模型",
-        "refactored_tag": "refactored:方法",
-        "max_age_days": 60,
-        "priority": "low",
-    },
+# ── 自动领域发现配置（v2.2 改造：零配置，按 Holographic 实际数据聚类）─────────
+DOMAIN_CACHE_PATH = Path(os.environ.get("HOLOGRAPHIC_REPORT_DIR", str(Path.home() / ".hermes" / "data" / "cirAAF"))) / "domain_cache.json"
+MIN_CLUSTER_SIZE = 5            # 聚类最小 fact 数（小于此数的散点合并到 misc）
+MAX_CLUSTERS = 15               # 最多聚类数（超过按 fact 数取 top N + 溢出合并 misc）
+SIMILARITY_THRESHOLD = 0.18     # Jaccard 相似度阈值（经验值，0.15-0.25 平衡点）
+TOP_CANDIDATES = 200            # 倒排索引候选 top N（控制 O(n×N) 计算量）
+RECACHE_IF_FACTS_GREW_BY = 0.20 # fact 总数增长超 20% 触发强制重发现
+STOP_KEYWORDS = {                # 聚类命名停用词
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "this", "that",
+    "these", "those", "it", "its", "和", "的", "是", "在", "了", "与", "或", "也", "但", "就", "都",
 }
+
+
+def extract_features(fact: dict) -> set:
+    """从一条 fact 提取特征集（中文 2-gram + 英文单词 + tags + category）
+
+    设计要点：
+    - 中文 2-gram 防 FTS5 不分词问题（"PE"是单字会被 FTS5 跳过，2-gram 才能抓住"投资PE"）
+    - 保留 tags 和 category 作为强特征（高信息量）
+    """
+    content = fact.get("content", "") or ""
+    tags_str = fact.get("tags", "") or ""
+    category = fact.get("category", "") or ""
+
+    # 中文 2-gram
+    cjk_segs = re.findall(r"[\u4e00-\u9fff]+", content)
+    bigrams = set()
+    for seg in cjk_segs:
+        if len(seg) >= 2:
+            for i in range(len(seg) - 1):
+                bigrams.add(seg[i:i + 2])
+
+    # 英文/数字单词（≥2 字符）
+    words = set(re.findall(r"[a-zA-Z_][a-zA-Z_0-9]+", content))
+
+    # tags
+    tag_set = {t.strip() for t in tags_str.split(",") if t.strip()}
+
+    feats = bigrams | words | tag_set
+    if category:
+        feats.add(category)
+    return feats
+
+
+def jaccard(set_a: set, set_b: set) -> float:
+    """Jaccard 相似度 = |A∩B| / |A∪B|"""
+    if not set_a or not set_b:
+        return 0.0
+    inter = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return inter / union if union else 0.0
+
+
+def auto_discover_domains(conn: sqlite3.Connection) -> dict[str, dict]:
+    """
+    自动从 Holographic 聚类出 N 个"自然领域"（v2.2 零配置核心）
+
+    算法 4 步：
+      ① 拉所有 trust > 0.3 的 fact（排除已降权垃圾）
+      ② 提取 2-gram 特征
+      ③ 倒排索引 + 贪心连通子图聚类（O(n × TOP_CANDIDATES) ≈ 1.5M 次比较/7774 facts）
+      ④ Top 3 关键词拼接命名（v2.3+ 可接 LLM 命名）
+
+    返回结构兼容原 DOMAINS：
+      {
+        "投资-PE+动量+止盈": {
+          "members": [1, 2, 3, ...],        # fact_id 列表（替代 categories）
+          "fact_count": 234,
+          "avg_trust": 0.65,
+          "zero_retrieval_rate": 0.45,
+          "health": 56,
+          "top_keywords": ["PE", "动量", "止盈", "基金", "估值"],
+        },
+        ...
+      }
+    """
+    # ① 拉 fact
+    cur = conn.execute(
+        "SELECT fact_id, content, category, tags, trust_score, retrieval_count "
+        "FROM facts WHERE trust_score > 0.3"
+    )
+    facts = [dict(r) for r in cur]
+    if len(facts) < MIN_CLUSTER_SIZE:
+        return {"misc": {
+            "members": [f["fact_id"] for f in facts],
+            "fact_count": len(facts),
+            "top_keywords": [],
+            "health": 0,
+        }}
+
+    # ② 特征提取
+    features: dict[int, set] = {}
+    for f in facts:
+        feats = extract_features(f)
+        if feats:
+            features[f["fact_id"]] = feats
+    if not features:
+        return {"misc": {"members": [], "fact_count": 0, "top_keywords": [], "health": 0}}
+
+    # ③ 倒排索引
+    inverted: dict[str, set] = {}
+    for fid, feats in features.items():
+        for f in feats:
+            inverted.setdefault(f, set()).add(fid)
+
+    # ④ 贪心聚类（hub 节点优先：高连接度 fact 先开聚类）
+    fact_freq = {
+        fid: sum(len(inverted.get(feat, set())) for feat in feats)
+        for fid, feats in features.items()
+    }
+    sorted_fids = sorted(features.keys(), key=lambda fid: -fact_freq.get(fid, 0))
+
+    clusters: list[set] = []
+    visited: set = set()
+
+    for fid in sorted_fids:
+        if fid in visited:
+            continue
+        target_feats = features[fid]
+        # 找 top 候选
+        candidate_count: Counter = Counter()
+        for f in target_feats:
+            for other_fid in inverted.get(f, set()):
+                if other_fid != fid:
+                    candidate_count[other_fid] += 1
+        # 算 Jaccard（top TOP_CANDIDATES 候选）
+        cluster = {fid}
+        for other_fid, intersect in candidate_count.most_common(TOP_CANDIDATES):
+            if other_fid in visited:
+                continue
+            other_feats = features[other_fid]
+            union_size = len(target_feats) + len(other_feats) - intersect
+            sim = intersect / union_size if union_size > 0 else 0
+            if sim >= SIMILARITY_THRESHOLD:
+                cluster.add(other_fid)
+        if len(cluster) >= MIN_CLUSTER_SIZE:
+            clusters.append(cluster)
+            visited |= cluster
+        else:
+            visited.add(fid)  # 散点不开新聚类，留给 misc 收容
+
+    # ⑤ 散点合并到 misc
+    big_clusters = [c for c in clusters if len(c) >= MIN_CLUSTER_SIZE]
+    misc = set()
+    for c in clusters:
+        if len(c) < MIN_CLUSTER_SIZE:
+            misc |= c
+    # 散点 fact（从未被任何聚类收容的）
+    for fid in features:
+        if fid not in visited:
+            misc.add(fid)
+    if misc:
+        big_clusters.append(misc)
+
+    # ⑥ 限制聚类数（按 fact 数取 top MAX_CLUSTERS，溢出合并到 misc）
+    big_clusters.sort(key=lambda c: -len(c))
+    if len(big_clusters) > MAX_CLUSTERS:
+        top_clusters = big_clusters[:MAX_CLUSTERS - 1]
+        overflow = set()
+        for c in big_clusters[MAX_CLUSTERS - 1:]:
+            overflow |= c
+        if overflow:
+            top_clusters.append(overflow)
+        big_clusters = top_clusters
+
+    # ⑦ 命名 + 健康分
+    domains: dict[str, dict] = {}
+    fact_id_to_data = {f["fact_id"]: f for f in facts}
+
+    for i, cluster in enumerate(big_clusters):
+        # 统计 top 5 关键词
+        kw_counter: Counter = Counter()
+        for fid in cluster:
+            for f in features.get(fid, []):
+                kw_counter[f] += 1
+        for stop in STOP_KEYWORDS:
+            kw_counter.pop(stop, None)
+        top_keywords = [k for k, _ in kw_counter.most_common(5)]
+
+        # 命名（前 3 关键词拼接；不足 3 个用 cluster_N 兜底）
+        if len(top_keywords) >= 3:
+            name = "+".join(top_keywords[:3])
+        elif top_keywords:
+            name = "+".join(top_keywords)
+        else:
+            name = f"cluster_{i}"
+
+        # 健康分
+        members_data = [fact_id_to_data[fid] for fid in cluster if fid in fact_id_to_data]
+        if not members_data:
+            continue
+        avg_trust = sum(m["trust_score"] for m in members_data) / len(members_data)
+        zero_ret = sum(1 for m in members_data if (m.get("retrieval_count") or 0) == 0)
+        zero_ret_rate = zero_ret / len(members_data)
+        health = int(avg_trust * (1 - zero_ret_rate) * 100)
+
+        domains[name] = {
+            "members": [m["fact_id"] for m in members_data],
+            "fact_count": len(members_data),
+            "avg_trust": round(avg_trust, 3),
+            "zero_retrieval_rate": round(zero_ret_rate, 3),
+            "health": health,
+            "top_keywords": top_keywords,
+        }
+
+    return domains
+
+
+def load_or_discover_domains(conn: sqlite3.Connection, force_rediscover: bool = False) -> dict:
+    """
+    带缓存的自动聚类（主入口）
+
+    - 缓存存在 + 不强制重发现 + fact 增长 < 20% → 直接读缓存
+    - 否则跑 auto_discover_domains() + 写缓存
+
+    缓存位置：~/.hermes/data/cirAAF/domain_cache.json
+    """
+    DOMAIN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if not force_rediscover and DOMAIN_CACHE_PATH.exists():
+        try:
+            cache = json.loads(DOMAIN_CACHE_PATH.read_text(encoding="utf-8"))
+            cur = conn.execute("SELECT COUNT(*) FROM facts")
+            current_count = cur.fetchone()[0]
+            cached_count = cache.get("fact_count_at_cache", 0)
+            grew = (current_count - cached_count) / max(cached_count, 1)
+            if grew < RECACHE_IF_FACTS_GREW_BY:
+                return cache["domains"]
+        except (json.JSONDecodeError, KeyError, OSError):
+            pass  # 缓存损坏，重发现
+
+    domains = auto_discover_domains(conn)
+
+    cur = conn.execute("SELECT COUNT(*) FROM facts")
+    fact_count = cur.fetchone()[0]
+    cache = {
+        "discovered_at": datetime.now().isoformat(),
+        "fact_count_at_cache": fact_count,
+        "config": {
+            "MIN_CLUSTER_SIZE": MIN_CLUSTER_SIZE,
+            "MAX_CLUSTERS": MAX_CLUSTERS,
+            "SIMILARITY_THRESHOLD": SIMILARITY_THRESHOLD,
+        },
+        "domains": domains,
+    }
+    DOMAIN_CACHE_PATH.write_text(
+        json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return domains
 
 def _compute_decay_thresholds(conn: sqlite3.Connection) -> dict[str, int]:
     """动态计算衰减阈值：基于数据库实际年龄"""
@@ -124,15 +338,16 @@ def since(days: int) -> str:
 
 
 def scan_domain(conn: sqlite3.Connection, domain: str, cfg: dict) -> dict[str, Any]:
-    """扫描单个领域的健康指标"""
-    cats = cfg["categories"]
-    placeholders = ",".join("?" for _ in cats)
-    safe_age = since(14)
+    """扫描单个领域的健康指标（v2.2 改造：按 fact_id members 过滤）"""
+    members = cfg.get("members", [])
+    placeholders = ",".join("?" for _ in members) if members else "NULL"
+    # 兜底 refactored_tag（v2.2 聚类名带关键词，不一定匹配旧硬编码 tag）
+    refactored_tag = cfg.get("refactored_tag", f"refactored:{domain}")
 
     # 该领域总事实数
     cur = conn.execute(
-        f"SELECT COUNT(*) FROM facts WHERE category IN ({placeholders})",
-        cats,
+        f"SELECT COUNT(*) FROM facts WHERE fact_id IN ({placeholders})",
+        members,
     )
     total = cur.fetchone()[0]
 
@@ -144,37 +359,37 @@ def scan_domain(conn: sqlite3.Connection, domain: str, cfg: dict) -> dict[str, A
             SUM(CASE WHEN trust_score >= 0.7 THEN 1 ELSE 0 END) as high,
             SUM(CASE WHEN trust_score < 0.7 AND trust_score >= 0.4 THEN 1 ELSE 0 END) as mid,
             SUM(CASE WHEN trust_score < 0.4 THEN 1 ELSE 0 END) as low
-        FROM facts WHERE category IN ({placeholders})""",
-        cats,
+        FROM facts WHERE fact_id IN ({placeholders})""",
+        members,
     )
     stats = dict(cur.fetchone())
 
     # 零检索事实
     cur = conn.execute(
-        f"SELECT COUNT(*) FROM facts WHERE category IN ({placeholders}) AND retrieval_count = 0",
-        cats,
+        f"SELECT COUNT(*) FROM facts WHERE fact_id IN ({placeholders}) AND retrieval_count = 0",
+        members,
     )
     zero_retrieval = cur.fetchone()[0]
 
-    # 已标记 refactored 的事实
+    # 已标记 refactored 的事实（v2.2 兜底：tag 名可能含聚类关键词而非硬编码）
     cur = conn.execute(
-        f"SELECT COUNT(*) FROM facts WHERE category IN ({placeholders}) AND tags LIKE ?",
-        cats + [f"%{cfg['refactored_tag']}%"],
+        "SELECT COUNT(*) FROM facts WHERE fact_id IN (" + placeholders + ") AND tags LIKE ?",
+        members + [f"%{refactored_tag}%"],
     )
     refactored_count = cur.fetchone()[0]
 
     # 最近 refactored 时间
     cur = conn.execute(
         f"""SELECT updated_at FROM facts
-            WHERE category IN ({placeholders}) AND tags LIKE ?
+            WHERE fact_id IN ({placeholders}) AND tags LIKE ?
             ORDER BY updated_at DESC LIMIT 1""",
-        cats + [f"%{cfg['refactored_tag']}%"],
+        members + [f"%{refactored_tag}%"],
     )
     row = cur.fetchone()
     last_refactored = row["updated_at"] if row else "never"
 
     # 健康分 (0-100)
-    health = _compute_health(total, stats["avg_trust"] or 0.5, zero_retrieval, total)
+    health = cfg.get("health", _compute_health(total, stats["avg_trust"] or 0.5, zero_retrieval, total))
 
     return {
         "domain": domain,
@@ -188,8 +403,9 @@ def scan_domain(conn: sqlite3.Connection, domain: str, cfg: dict) -> dict[str, A
         "refactored_count": refactored_count,
         "last_refactored": last_refactored,
         "health_score": health,
-        "priority": cfg["priority"],
-        "max_age_days": cfg["max_age_days"],
+        "priority": cfg.get("priority", "auto"),  # v2.2 兜底：聚类无 priority
+        "max_age_days": cfg.get("max_age_days", 30),  # v2.2 兜底：聚类无 max_age_days
+        "top_keywords": cfg.get("top_keywords", []),  # v2.2 新增：聚类关键词
     }
 
 
@@ -250,16 +466,16 @@ def _check_domain_decay_readiness(
     history: dict[str, list[dict]],
 ) -> tuple[bool, str]:
     """
-    判断一个领域是否达到衰减条件。
+    判断一个领域是否达到衰减条件（v2.2 改造：按 fact_id members 过滤）。
     返回 (ready, reason)。
     """
-    cats = cfg["categories"]
-    ph = ",".join("?" for _ in cats)
+    members = cfg.get("members", [])
+    ph = ",".join("?" for _ in members) if members else "NULL"
 
     # 条件1：至少有5条事实 trust > 0.7（表明模型手动升权形成了分层）
     cur = conn.execute(
-        f"SELECT COUNT(*) FROM facts WHERE category IN ({ph}) AND trust_score > 0.7",
-        cats,
+        f"SELECT COUNT(*) FROM facts WHERE fact_id IN ({ph}) AND trust_score > 0.7",
+        members,
     )
     high_trust_count = cur.fetchone()[0]
     if high_trust_count < 5:
@@ -282,8 +498,8 @@ def _check_domain_decay_readiness(
 
     # 条件3：事实年龄 > 中位年龄 * 1.5（动态阈值）
     cur = conn.execute(
-        f"SELECT created_at FROM facts WHERE category IN ({ph}) ORDER BY created_at ASC",
-        cats,
+        f"SELECT created_at FROM facts WHERE fact_id IN ({ph}) ORDER BY created_at ASC",
+        members,
     )
     ages = [r[0] for r in cur.fetchall()]
     if not ages:
@@ -295,8 +511,8 @@ def _check_domain_decay_readiness(
     threshold_days = max(14, int(median_age_days * 1.5))
 
     cur = conn.execute(
-        f"SELECT COUNT(*) FROM facts WHERE category IN ({ph}) AND created_at < ?",
-        cats + [since(threshold_days)],
+        f"SELECT COUNT(*) FROM facts WHERE fact_id IN ({ph}) AND created_at < ?",
+        members + [since(threshold_days)],
     )
     old_count = cur.fetchone()[0]
     if old_count < 5:
@@ -306,16 +522,19 @@ def _check_domain_decay_readiness(
 
 
 def apply_decay(dry_run: bool = True) -> list[dict]:
-    """应用机械衰减规则，返回操作记录"""
+    """应用机械衰减规则，返回操作记录（v2.2 改造：基于自动聚类）"""
     conn = get_db()
     thresholds = _compute_decay_thresholds(conn)
     history = _load_health_history()
+
+    # v2.2 改造：用 load_or_discover_domains() 替代硬编码 DOMAINS
+    domains = load_or_discover_domains(conn)
 
     # 替换旧版年龄守卫：改为每领域独立判断三条件
     # 先扫描所有领域健康状态（复用 scan_domain）
     domain_ready: dict[str, str] = {}
     all_stats = []
-    for domain, cfg in DOMAINS.items():
+    for domain, cfg in domains.items():
         stats = scan_domain(conn, domain, cfg)
         all_stats.append(stats)
         ready, reason = _check_domain_decay_readiness(conn, domain, cfg, history)
@@ -336,21 +555,21 @@ def apply_decay(dry_run: bool = True) -> list[dict]:
 
     operations: list[dict] = []
 
-    # 只对满足条件的领域执行衰减
-    ready_categories: list[str] = []
+    # 只对满足条件的领域执行衰减（v2.2 改造：members 是 fact_id 列表）
+    ready_members: list[int] = []
     for domain in ready_domains:
-        ready_categories.extend(DOMAINS[domain]["categories"])
-    ready_ph = ",".join("?" for _ in ready_categories)
+        ready_members.extend(domains[domain].get("members", []))
+    ready_ph = ",".join("?" for _ in ready_members) if ready_members else "NULL"
 
     for rule_name, rule in DECAY_RULES.items():
-        params = ready_categories.copy()
+        params = ready_members.copy()
         if "age_key" in rule:
             params.append(since(thresholds[rule["age_key"]]))
         elif rule.get("age_days", 0) > 0:
             params.append(since(rule["age_days"]))
 
-        # 加 category 过滤：只衰减就绪领域内的事实
-        condition_with_domain = f"category IN ({ready_ph}) AND {rule['condition']}"
+        # v2.2 改造：按 fact_id 过滤
+        condition_with_domain = f"fact_id IN ({ready_ph}) AND {rule['condition']}"
         cur = conn.execute(
             f"SELECT fact_id, content, trust_score, tags FROM facts WHERE {condition_with_domain}",
             params,
@@ -389,8 +608,9 @@ def apply_decay(dry_run: bool = True) -> list[dict]:
 
 
 def build_refactor_package(domain: str | None = None) -> dict:
-    """生成供 LLM cron 使用的反射数据包"""
+    """生成供 LLM cron 使用的反射数据包（v2.2 改造：基于自动聚类）"""
     conn = get_db()
+    domains = load_or_discover_domains(conn)
 
     package = {
         "generated_at": datetime.now().isoformat(),
@@ -398,39 +618,39 @@ def build_refactor_package(domain: str | None = None) -> dict:
         "domains": {},
     }
 
-    targets = [domain] if domain else list(DOMAINS.keys())
+    targets = [domain] if domain else list(domains.keys())
     for d in targets:
-        if d not in DOMAINS:
+        if d not in domains:
             continue
-        cfg = DOMAINS[d]
-        cats = cfg["categories"]
-        placeholders = ",".join("?" for _ in cats)
+        cfg = domains[d]
+        members = cfg.get("members", [])
+        placeholders = ",".join("?" for _ in members) if members else "NULL"
 
         # 收集所有该领域事实
         cur = conn.execute(
             f"""SELECT fact_id, content, category, tags, trust_score,
                        retrieval_count, helpful_count, created_at, updated_at
-                FROM facts WHERE category IN ({placeholders})
+                FROM facts WHERE fact_id IN ({placeholders})
                 ORDER BY trust_score ASC LIMIT 200""",
-            cats,
+            members,
         )
         facts = [dict(r) for r in cur.fetchall()]
 
         # 统计指标
         cur = conn.execute(
-            f"SELECT COUNT(*) FROM facts WHERE category IN ({placeholders}) AND trust_score < 0.5",
-            cats,
+            f"SELECT COUNT(*) FROM facts WHERE fact_id IN ({placeholders}) AND trust_score < 0.5",
+            members,
         )
         low_trust_count = cur.fetchone()[0]
 
         cur = conn.execute(
-            f"SELECT COUNT(*) FROM facts WHERE category IN ({placeholders}) AND retrieval_count = 0 AND created_at < ?",
-            cats + [since(30)],
+            f"SELECT COUNT(*) FROM facts WHERE fact_id IN ({placeholders}) AND retrieval_count = 0 AND created_at < ?",
+            members + [since(30)],
         )
         stale_count = cur.fetchone()[0]
 
         package["domains"][d] = {
-            "config": {k: v for k, v in cfg.items() if k != "categories"},
+            "config": {k: v for k, v in cfg.items() if k != "members"},
             "stats": {
                 "total": len(facts),
                 "low_trust_count": low_trust_count,
@@ -567,12 +787,13 @@ def print_report(all_stats: list[dict]) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CIRAAF 大脑机械引擎")
+    parser = argparse.ArgumentParser(description="CIRAAF 大脑机械引擎（v2.2 零配置自动聚类）")
     parser.add_argument("--decay", action="store_true", help="执行机械衰减（dry-run 默认）")
     parser.add_argument("--apply", action="store_true", help="配合 --decay 实际执行")
-    parser.add_argument("--domain", type=str, help="单领域详细扫描")
+    parser.add_argument("--domain", type=str, help="单领域详细扫描（聚类名，如 '投资-PE+动量+止盈'）")
     parser.add_argument("--refactor-report", action="store_true", help="生成 Gear 2 反射数据包")
     parser.add_argument("--apply-refactor", type=str, help="应用 Gear 2 修复指令（JSON 文件路径）")
+    parser.add_argument("--rediscover", action="store_true", help="v2.2 强制重发现领域（忽略缓存）")
     parser.add_argument("--output", type=str, help="输出到文件")
     args = parser.parse_args()
 
@@ -607,18 +828,25 @@ def main():
             Path(args.output).write_text(json.dumps(ops, ensure_ascii=False, indent=2))
         return
 
-    # ── 全领域扫描 ──
+    # ── 全领域扫描（v2.2 改造：先 load_or_discover_domains） ──
     conn = get_db()
+    domains = load_or_discover_domains(conn, force_rediscover=args.rediscover)
     all_stats = []
-    for domain, cfg in DOMAINS.items():
+    for domain, cfg in domains.items():
         if args.domain and domain != args.domain:
             continue
         stats = scan_domain(conn, domain, cfg)
         all_stats.append(stats)
     conn.close()
 
-    # ── 单领域详细扫描 ──
+    # ── 单领域详细扫描（v2.2 改造：找不到领域时友好提示） ──
     if args.domain:
+        if not all_stats:
+            print(f"\n❌ 错误：领域 '{args.domain}' 不存在")
+            print(f"   可用领域（自动聚类）: {list(domains.keys())[:10]}")
+            print(f"   提示：用默认报告看真实领域名（不是 --domain 传硬编码）")
+            conn.close()
+            sys.exit(1)
         s = all_stats[0]
         print(f"\n{'='*50}")
         print(f"  🔍 详细扫描: {s['domain']}")

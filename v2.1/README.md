@@ -41,7 +41,7 @@
 | 定位 | 领域级结构一致性 |
 | 实现 | `agent/cirAAF_mechanic.py` + `brain-periodic-refactor` skill + cron 每周日 10:00 |
 | 三齿轮 | Gear 1（源码机械引擎）+ Gear 2（cron skill 反射）+ Gear 3（源码应用修复） |
-| 5 大领域 | **实时数据**（默认行为：运行 `python3 -m agent.cirAAF_mechanic` 获取；数值依事实库而异） |
+| 5 大领域（v2.1）→ 自动聚类（v2.2） | v2.1：硬编码 5 大领域（投资/系统/用户/开发/方法）｜v2.2：零配置，从 Holographic 实际数据自动聚类 N 个"自然领域"（按 fact content 2-gram + tag + category 特征，Jaccard 贪心连通子图聚类，Top 3 关键词命名） |
 | 机械衰减 | DB >60 天激活；年龄守卫保护幼年数据 |
 | 零 LLM 比例 | 3 个 cron 中 2 个是 no_agent（~66% 零 LLM） |
 
@@ -92,7 +92,9 @@ hermes cron add --name "CIRAAF 周健康报告" \
 # 5. 健康验证（默认输出健康报告；--decay 三条件检查；--domain 详细扫描）
 python3 -m agent.cirAAF_mechanic
 python3 -m agent.cirAAF_mechanic --decay
-python3 -m agent.cirAAF_mechanic --domain 投资
+# v2.2 自动聚类：领域名是动态生成的（如"投资-PE+动量+止盈"），先用默认报告看真实领域名
+python3 -m agent.cirAAF_mechanic --rediscover  # 强制重发现（忽略缓存）
+python3 -m agent.cirAAF_mechanic --domain "投资-PE+动量+止盈"  # 用真实聚类名扫描
 ```
 
 > **注意**：v2.1 的 `cirAAF_mechanic.py` 不支持 `--report` 参数（早期版本有过，已移除）。默认行为就是输出健康报告。完整参数见 `python3 -m agent.cirAAF_mechanic --help`。
