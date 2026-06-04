@@ -41,7 +41,7 @@
 | 定位 | 领域级结构一致性 |
 | 实现 | `agent/cirAAF_mechanic.py` + `brain-periodic-refactor` skill + cron 每周日 10:00 |
 | 三齿轮 | Gear 1（源码机械引擎）+ Gear 2（cron skill 反射）+ Gear 3（源码应用修复） |
-| 5 大领域 | **实时数据**（运行 `python3 -m agent.cirAAF_mechanic --report` 获取；数值依事实库而异） |
+| 5 大领域 | **实时数据**（默认行为：运行 `python3 -m agent.cirAAF_mechanic` 获取；数值依事实库而异） |
 | 机械衰减 | DB >60 天激活；年龄守卫保护幼年数据 |
 | 零 LLM 比例 | 3 个 cron 中 2 个是 no_agent（~66% 零 LLM） |
 
